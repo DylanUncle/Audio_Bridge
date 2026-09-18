@@ -46,6 +46,11 @@ static bool s_pickerShown = false;
 // 【居中修复】IDT_CENTERPICKER 定时器的重试计数（每次 Show 时清零，
 // 见 TryCenterPickerFlyout 与 ShowDevicePickerAtTray）
 static unsigned s_centerTicks = 0;
+// 【居中修复】Show 前的可见窗口快照——用于系统级搜索 flyout：
+// DevicePicker 的 flyout 窗口【不在本进程内】（由系统/XAML 运行时托管），
+// 只能用"Show 后新出现的可见窗口"来定位。Show 前先快照所有可见顶层窗口，
+// 定时器中找差集即为 flyout。
+static std::unordered_set<HWND> s_preShowWindows;
 // 前置声明：WndProc 的 WM_TIMER 分支先于函数定义处调用
 void TryCenterPickerFlyout(HWND hWnd);
 // 蓝牙 HCI 接口 GUID（文件作用域：注册通知与 WM_DEVICECHANGE 过滤共用）
@@ -869,8 +874,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 //   4) picker 处于"显示中"时再次调用 Show() 会抛 hresult_error，异常逃出
 //      WndProc → std::terminate → 进程无声退出（"多点几次程序就没了"）。
 // 修复：隐藏宿主窗口置顶铺屏 → SetForegroundWindow → Hide 后
-// Show(工作区中心锚点, Placement::Above) → 定时器把 flyout 精确居中；
-// （锚点定位详见 ShowDevicePickerAtTray 内注释，此处不再依赖托盘图标矩形）
+// Show(工作区中心锚点, Placement::Above) → 定时器系统级搜索 flyout 并精确居中；
+// （flyout 不在本进程内，用 Show 前快照 + 差集定位，详见 TryCenterPickerFlyout）
 
 // 主窗口所在显示器的工作区（不含任务栏；多显示器下取主窗口所在屏）。
 // 取不到显示器信息时退回主屏工作区。
@@ -887,55 +892,55 @@ RECT WorkAreaOf(HWND hWnd)
 
 // 【居中修复】把 DevicePicker 的 flyout 窗口持续校正到工作区正中。
 // DevicePicker.Show 只支持"相邻于锚点矩形"放置（Above/Below/Left/Right），
-// 无法直接指定屏幕中心 —— 锚点定位的落点会偏离中心最多半个 flyout 尺寸。
-// flyout 窗口是本进程内【可见】的 CoreWindow（类名 "Windows.UI.Core.CoreWindow"，
-// 由 XAML 在 Show 之后经消息泵异步创建；线程常驻的 DesktopWindowXamlSource
-// CoreWindow 始终隐藏，不会误匹配）。
-// 【为什么必须"持续校正"而非移动一次】flyout 窗口的创建是异步的：本函数
-//   可能在窗口刚可见、XAML 布局/入场定位尚未完成时就移动它，随后 XAML
-//   会再次定位窗口，把我们的移动覆盖掉 —— 实测表现为"水平居中了、垂直
-//   不居中"（水平居中其实来自居中锚点，而非移动生效）。因此由
-//   IDT_CENTERPICKER 定时器（60ms）持续监视：窗口出现且尺寸稳定 →
-//   SetWindowPos 到工作区正中（只挪位置，不改大小/层级/激活状态）；
-//   位置偏离目标（被 XAML 拉回锚点位置）→ 再搬回来；已在目标位（±1px
-//   容差）→ 本拍空转不调用 SetWindowPos，避免无谓的重排扰动。
-//   picker 关闭（s_pickerShown=false）或超时（3s）→ 停表。
+// 无法直接指定屏幕中心 —— Placement::Above 把 flyout 放在锚点上方，
+// 锚点在屏幕中心时 flyout 落在上半区，垂直方向不居中。
+// 【关键发现】flyout 窗口【不在本进程内】——它由系统/XAML 运行时托管
+// （可能是 ApplicationFrameWindow 的子窗或独立进程的 CoreWindow），
+// 所以不能用 PID 过滤 EnumWindows。改用 Show 前快照 + Show 后差集定位：
+// s_preShowWindows 在 Show 前记录所有可见顶层窗口，定时器中找新出现的
+// 可见窗口（尺寸 > 100px）即为 flyout。
+// 【为什么必须"持续校正"而非移动一次】flyout 窗口的创建是异步的：
+//   窗口刚可见时 XAML 布局/入场定位仍在进行，移动会被覆盖。定时器
+//   （60ms）持续监视并反复校正到工作区正中，直至 picker 关闭或超时（3s）。
 void TryCenterPickerFlyout(HWND hWnd)
 {
 	if (!s_pickerShown)
 	{
 		KillTimer(hWnd, IDT_CENTERPICKER);
+		s_preShowWindows.clear();
 		return;
 	}
-	// 安全上限（50 × 60ms ≈ 3s）：flyout 迟迟未创建（如 XAML 忙）就放弃
-	//（保留锚点定位的近似居中位置即可，不做无谓轮询）
+	// 安全上限（50 × 60ms ≈ 3s）：flyout 迟迟未创建就放弃
 	if (++s_centerTicks > 50)
 	{
 		KillTimer(hWnd, IDT_CENTERPICKER);
+		s_preShowWindows.clear();
 		return;
 	}
 
-	struct FindCtx { DWORD pid; HWND found; } ctx{ GetCurrentProcessId(), nullptr };
+	// 系统级搜索：找 Show 后新出现的可见窗口（不在快照中）
+	struct FindCtx { HWND found; } ctx{ nullptr };
 	EnumWindows([](HWND h, LPARAM lp) -> BOOL
 		{
 			auto* const c = reinterpret_cast<FindCtx*>(lp);
+			if (!IsWindowVisible(h)) return TRUE;
+			// 排除 Show 前已存在的窗口
+			if (s_preShowWindows.count(h) > 0) return TRUE;
+			// 排除本进程的隐藏宿主窗口（虽然 IsWindowVisible 已过滤，双保险）
 			DWORD pid = 0;
 			GetWindowThreadProcessId(h, &pid);
-			wchar_t cls[64];
-			if (pid == c->pid && IsWindowVisible(h)
-				&& GetClassNameW(h, cls, 64) > 0
-				&& wcscmp(cls, L"Windows.UI.Core.CoreWindow") == 0)
-			{
-				c->found = h;
-				return FALSE;
-			}
-			return TRUE;
+			if (pid == GetCurrentProcessId()) return TRUE;
+			// 尺寸合理（flyout 通常 200×300 ~ 600×800）
+			RECT r{};
+			if (!GetWindowRect(h, &r)) return TRUE;
+			if (r.right - r.left < 100 || r.bottom - r.top < 100) return TRUE;
+			if (r.right - r.left > 1200 || r.bottom - r.top > 1200) return TRUE;
+			c->found = h;
+			return FALSE;
 		}, reinterpret_cast<LPARAM>(&ctx));
 
 	if (!ctx.found)
 		return;  // flyout 尚未创建，下一拍再试
-	// 注意：这里【不停表】——窗口刚可见时 XAML 布局/入场定位还在进行，
-	// 移动可能被覆盖，须继续监视并反复校正（见函数头注释）。
 
 	RECT wr{};
 	if (!GetWindowRect(ctx.found, &wr)
@@ -996,19 +1001,31 @@ void ShowDevicePickerAtTray()
 			picker.Hide();
 
 		// 4) 【居中修复】锚点矩形 = 工作区中心（不再依赖托盘图标位置）。
-		//    任务栏可在屏幕任意边：任务栏在顶部时，图标矩形贴着屏幕上沿，
-		//    Placement::Above 没有放置空间，系统会把 flyout 回退到右下角
-		//    （默认任务栏位置）。需求是无论任务栏在哪，设备列表都在屏幕正中。
-		//    DevicePicker 只支持"相邻于锚点"放置，无法直接指定中心 —— 先以
-		//    工作区中心点作锚（物理像素 → DIP，Rect 以 96 DPI 为基准），
-		//    Show 后由 TryCenterPickerFlyout 按 flyout 真实尺寸精确居中。
+		//    Placement::Above 把 flyout 放在锚点上方——锚点在中心时 flyout
+		//    落在上半区。为补偿：把锚点 Y 下移约半个 flyout 高度（≈工作区
+		//    高度的 15%），使 flyout 底部在中心下方、顶部在中心上方，近似居中。
+		//    定时器随后用 flyout 真实尺寸精确校正（见 TryCenterPickerFlyout）。
 		const RECT wa = WorkAreaOf(hWnd);
 		const UINT dpi = GetDpiForWindow(hWnd);
 		const float scale = static_cast<float>(USER_DEFAULT_SCREEN_DPI) / static_cast<float>(dpi);
+		// 锚点 Y 下移：补偿 Placement::Above 的偏移（flyout 底=锚点 Y）
+		const float waH = static_cast<float>(wa.bottom - wa.top);
+		const float offsetY = waH * 0.15f;  // ≈半个 flyout 高度
 		const winrt::Windows::Foundation::Rect anchor{
 			((wa.left + wa.right) * 0.5f) * scale - 1.0f,
-			((wa.top + wa.bottom) * 0.5f) * scale - 1.0f,
+			((wa.top + wa.bottom) * 0.5f + offsetY) * scale - 1.0f,
 			2.0f, 2.0f };
+
+		// 4b) Show 前快照所有可见顶层窗口——定时器用差集定位 flyout
+		//    （flyout 不在本进程内，只能用"新出现的可见窗口"来识别）
+		s_preShowWindows.clear();
+		EnumWindows([](HWND h, LPARAM lp) -> BOOL
+			{
+				if (IsWindowVisible(h))
+					reinterpret_cast<std::unordered_set<HWND>*>(lp)->insert(h);
+				return TRUE;
+			}, reinterpret_cast<LPARAM>(&s_preShowWindows));
+
 		picker.Show(anchor, winrt::Windows::UI::Popups::Placement::Above);
 		s_pickerShown = true;
 
@@ -1048,7 +1065,10 @@ void SetupDevicePicker()
 
 	// flyout 关闭（用户点击别处 / 选择设备 / 断开）时清除显示状态标志，
 	// 供 ShowDevicePickerAtTray 的条件 Hide 与连点防护使用
-	picker.DevicePickerDismissed([](const auto&, const auto&) { s_pickerShown = false; });
+	picker.DevicePickerDismissed([](const auto&, const auto&) {
+		s_pickerShown = false;
+		s_preShowWindows.clear();
+	});
 
 	picker.DeviceSelected([](const auto& sender, const auto& args)
 	{
