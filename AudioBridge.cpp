@@ -31,8 +31,9 @@ HANDLE g_hMutex = nullptr;
 constexpr UINT WM_APP_SHUTDOWNCOMPLETE = WM_APP + 0x100;
 
 // ===== P0 优化：电源管理 + 设备热插拔 + 健康检测 =====
-// 定时器 ID：1 已被重连调度器使用，2 用于连接健康检测
+// 定时器 ID：1 已被重连调度器使用，2 用于连接健康检测，3 用于 picker flyout 居中
 constexpr UINT_PTR IDT_HEALTHCHECK = 2;
+constexpr UINT_PTR IDT_CENTERPICKER = 3;
 constexpr UINT HEALTHCHECK_INTERVAL_MS = 30000;  // 30 秒一次
 // 蓝牙适配器设备通知句柄（RegisterDeviceNotification 返回）
 HDEVNOTIFY g_hDeviceNotify = nullptr;
@@ -42,6 +43,11 @@ HDEVNOTIFY g_hDeviceNotify = nullptr;
 //      若抛异常会让后续 Show 永远不执行（"点了没反应"的一层保险）；
 //   b) 连点防护的依据。
 static bool s_pickerShown = false;
+// 【居中修复】IDT_CENTERPICKER 定时器的重试计数（每次 Show 时清零，
+// 见 TryCenterPickerFlyout 与 ShowDevicePickerAtTray）
+static unsigned s_centerTicks = 0;
+// 前置声明：WndProc 的 WM_TIMER 分支先于函数定义处调用
+void TryCenterPickerFlyout(HWND hWnd);
 // 蓝牙 HCI 接口 GUID（文件作用域：注册通知与 WM_DEVICECHANGE 过滤共用）
 // GUID_DEVINTERFACE_BLUETOOTH = {0850302A-B344-4fda-9BE9-90576B8D46F0}
 constexpr GUID kGuidDevinterfaceBluetooth =
@@ -739,6 +745,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			// P0-2: 假连接健康检测 —— 蓝牙栈 StateChanged 不可靠，主动轮询所有连接状态
 			app.GetConnections().HealthCheck();
 		}
+		else if (wParam == IDT_CENTERPICKER)
+		{
+			// 【居中修复】把已显示的 picker flyout 挪到工作区正中
+			//（flyout 窗口由 XAML 异步创建，须轮询等待，见 TryCenterPickerFlyout）
+			TryCenterPickerFlyout(hWnd);
+		}
 		break;
 
 	// ======================================================================
@@ -856,8 +868,90 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 //   3) 宿主窗口未取得前台激活权，flyout 拿不到焦点，随即被系统自动关闭。
 //   4) picker 处于"显示中"时再次调用 Show() 会抛 hresult_error，异常逃出
 //      WndProc → std::terminate → 进程无声退出（"多点几次程序就没了"）。
-// 修复：Shell_NotifyIconGetRect 取图标真实矩形 → 换算 DIP → 隐藏宿主窗口
-// 置顶铺屏 → SetForegroundWindow → Hide 后 Show(rect, Placement::Above)；
+// 修复：隐藏宿主窗口置顶铺屏 → SetForegroundWindow → Hide 后
+// Show(工作区中心锚点, Placement::Above) → 定时器把 flyout 精确居中；
+// （锚点定位详见 ShowDevicePickerAtTray 内注释，此处不再依赖托盘图标矩形）
+
+// 主窗口所在显示器的工作区（不含任务栏；多显示器下取主窗口所在屏）。
+// 取不到显示器信息时退回主屏工作区。
+RECT WorkAreaOf(HWND hWnd)
+{
+	HMONITOR const hMon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi{ sizeof(mi) };
+	if (hMon && GetMonitorInfoW(hMon, &mi))
+		return mi.rcWork;
+	RECT wa{};
+	SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+	return wa;
+}
+
+// 【居中修复】把 DevicePicker 的 flyout 窗口持续校正到工作区正中。
+// DevicePicker.Show 只支持"相邻于锚点矩形"放置（Above/Below/Left/Right），
+// 无法直接指定屏幕中心 —— 锚点定位的落点会偏离中心最多半个 flyout 尺寸。
+// flyout 窗口是本进程内【可见】的 CoreWindow（类名 "Windows.UI.Core.CoreWindow"，
+// 由 XAML 在 Show 之后经消息泵异步创建；线程常驻的 DesktopWindowXamlSource
+// CoreWindow 始终隐藏，不会误匹配）。
+// 【为什么必须"持续校正"而非移动一次】flyout 窗口的创建是异步的：本函数
+//   可能在窗口刚可见、XAML 布局/入场定位尚未完成时就移动它，随后 XAML
+//   会再次定位窗口，把我们的移动覆盖掉 —— 实测表现为"水平居中了、垂直
+//   不居中"（水平居中其实来自居中锚点，而非移动生效）。因此由
+//   IDT_CENTERPICKER 定时器（60ms）持续监视：窗口出现且尺寸稳定 →
+//   SetWindowPos 到工作区正中（只挪位置，不改大小/层级/激活状态）；
+//   位置偏离目标（被 XAML 拉回锚点位置）→ 再搬回来；已在目标位（±1px
+//   容差）→ 本拍空转不调用 SetWindowPos，避免无谓的重排扰动。
+//   picker 关闭（s_pickerShown=false）或超时（3s）→ 停表。
+void TryCenterPickerFlyout(HWND hWnd)
+{
+	if (!s_pickerShown)
+	{
+		KillTimer(hWnd, IDT_CENTERPICKER);
+		return;
+	}
+	// 安全上限（50 × 60ms ≈ 3s）：flyout 迟迟未创建（如 XAML 忙）就放弃
+	//（保留锚点定位的近似居中位置即可，不做无谓轮询）
+	if (++s_centerTicks > 50)
+	{
+		KillTimer(hWnd, IDT_CENTERPICKER);
+		return;
+	}
+
+	struct FindCtx { DWORD pid; HWND found; } ctx{ GetCurrentProcessId(), nullptr };
+	EnumWindows([](HWND h, LPARAM lp) -> BOOL
+		{
+			auto* const c = reinterpret_cast<FindCtx*>(lp);
+			DWORD pid = 0;
+			GetWindowThreadProcessId(h, &pid);
+			wchar_t cls[64];
+			if (pid == c->pid && IsWindowVisible(h)
+				&& GetClassNameW(h, cls, 64) > 0
+				&& wcscmp(cls, L"Windows.UI.Core.CoreWindow") == 0)
+			{
+				c->found = h;
+				return FALSE;
+			}
+			return TRUE;
+		}, reinterpret_cast<LPARAM>(&ctx));
+
+	if (!ctx.found)
+		return;  // flyout 尚未创建，下一拍再试
+	// 注意：这里【不停表】——窗口刚可见时 XAML 布局/入场定位还在进行，
+	// 移动可能被覆盖，须继续监视并反复校正（见函数头注释）。
+
+	RECT wr{};
+	if (!GetWindowRect(ctx.found, &wr)
+		|| wr.right - wr.left < 50 || wr.bottom - wr.top < 50)
+		return;  // 尺寸未定（创建早期），下一拍再试
+
+	const RECT wa = WorkAreaOf(hWnd);
+	const int tx = wa.left + ((wa.right - wa.left) - (wr.right - wr.left)) / 2;
+	const int ty = wa.top + ((wa.bottom - wa.top) - (wr.bottom - wr.top)) / 2;
+	// 已在目标位（±1px）：不再 SetWindowPos，空转等下一拍（或停表）
+	if (std::abs(wr.left - tx) <= 1 && std::abs(wr.top - ty) <= 1)
+		return;
+	SetWindowPos(ctx.found, nullptr, tx, ty, 0, 0,
+		SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 // 整段 try/catch 兜底，任何 picker 故障只记日志，绝不终止进程。
 void ShowDevicePickerAtTray()
 {
@@ -884,39 +978,45 @@ void ShowDevicePickerAtTray()
 
 	try
 	{
-		// 1) 托盘图标的真实屏幕矩形（坐标恒定有效，不依赖光标位置）
-		NOTIFYICONIDENTIFIER nii = { sizeof(nii) };
-		nii.hWnd = app.GetMainWnd();
-		nii.uID = app.GetNid().uID;
-		RECT iconRect{};
-		winrt::check_hresult(Shell_NotifyIconGetRect(&nii, &iconRect));
-
-		// 2) 物理像素 → DIP（DevicePicker 的 Rect 以 96 DPI 为基准）
 		HWND const hWnd = app.GetMainWnd();
-		const UINT dpi = GetDpiForWindow(hWnd);
-		const float scale = static_cast<float>(USER_DEFAULT_SCREEN_DPI) / static_cast<float>(dpi);
-		const winrt::Windows::Foundation::Rect rect{
-			static_cast<float>(iconRect.left) * scale,
-			static_cast<float>(iconRect.top) * scale,
-			static_cast<float>(iconRect.right - iconRect.left) * scale,
-			static_cast<float>(iconRect.bottom - iconRect.top) * scale };
 
-		// 3) 隐藏宿主窗口置顶并铺满屏幕：flyout 从属于宿主，宿主不置顶就画不过
+		// 1) 隐藏宿主窗口置顶并铺满屏幕：flyout 从属于宿主，宿主不置顶就画不过
 		//    topmost 的任务栏。SWP_HIDEWINDOW 保证窗口保持隐藏，不会闪现。
 		SetWindowPos(hWnd, HWND_TOPMOST, 0, 0,
 			GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), SWP_HIDEWINDOW);
-		// 4) 抢占前台激活权，flyout 才不会被系统瞬间自动关闭
+		// 2) 抢占前台激活权，flyout 才不会被系统瞬间自动关闭
 		SetForegroundWindow(hWnd);
 
 		auto& picker = app.GetDevicePicker();
-		// 5) 只在确曾显示过时 Hide：picker 仍"显示中"时直接 Show 会抛异常
+		// 3) 只在确曾显示过时 Hide：picker 仍"显示中"时直接 Show 会抛异常
 		//    （连点崩溃的元凶）；而对从未显示过的 fresh picker 调 Hide 行为
 		//    未文档化，若抛异常会让后面的 Show 永远不执行。s_pickerShown 由
 		//    Show 成功置 true、DevicePickerDismissed 回调置 false，见全局定义。
 		if (s_pickerShown)
 			picker.Hide();
-		picker.Show(rect, winrt::Windows::UI::Popups::Placement::Above);
+
+		// 4) 【居中修复】锚点矩形 = 工作区中心（不再依赖托盘图标位置）。
+		//    任务栏可在屏幕任意边：任务栏在顶部时，图标矩形贴着屏幕上沿，
+		//    Placement::Above 没有放置空间，系统会把 flyout 回退到右下角
+		//    （默认任务栏位置）。需求是无论任务栏在哪，设备列表都在屏幕正中。
+		//    DevicePicker 只支持"相邻于锚点"放置，无法直接指定中心 —— 先以
+		//    工作区中心点作锚（物理像素 → DIP，Rect 以 96 DPI 为基准），
+		//    Show 后由 TryCenterPickerFlyout 按 flyout 真实尺寸精确居中。
+		const RECT wa = WorkAreaOf(hWnd);
+		const UINT dpi = GetDpiForWindow(hWnd);
+		const float scale = static_cast<float>(USER_DEFAULT_SCREEN_DPI) / static_cast<float>(dpi);
+		const winrt::Windows::Foundation::Rect anchor{
+			((wa.left + wa.right) * 0.5f) * scale - 1.0f,
+			((wa.top + wa.bottom) * 0.5f) * scale - 1.0f,
+			2.0f, 2.0f };
+		picker.Show(anchor, winrt::Windows::UI::Popups::Placement::Above);
 		s_pickerShown = true;
+
+		// 5) 启动居中定时器：flyout 窗口由 XAML 在 Show 之后异步创建，
+		//    其布局/入场定位可能覆盖我们的移动 —— 定时器持续监视并反复
+		//    校正到工作区正中，直至 picker 关闭或超时（见 TryCenterPickerFlyout）。
+		s_centerTicks = 0;
+		SetTimer(hWnd, IDT_CENTERPICKER, 60, nullptr);
 	}
 	catch (...)
 	{
