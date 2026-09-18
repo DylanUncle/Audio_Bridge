@@ -29,9 +29,6 @@ public:
 
 	[[nodiscard]] int RunMessageLoop();
 
-	// ---------------- 异步操作登记 ----------------
-	void RegisterPendingOp(winrt::Windows::Foundation::IAsyncAction op);
-
 	// ---------------- 访问器 ----------------
 	[[nodiscard]] HINSTANCE GetInstance() const noexcept;
 	[[nodiscard]] HWND GetMainWnd() const noexcept;
@@ -59,11 +56,14 @@ private:
 	AudioPlaybackApp();
 	~AudioPlaybackApp() = default;
 
-	void GarbageCollectCompletedOps_NoLock();
-
 	// ---------------- 新增子系统 ----------------
 	ConnectionManager m_connections;
 	std::atomic<bool> m_isCancelling{false};
+	// 【崩溃修复】in-flight 连接协程登记表：Launch* 协程启动时登记自身、
+	// 任何出口自摘除（纯指针比较，零虚调用）；ShutdownAsync 退出时快照清空
+	// 并限时等待。永不扫描调用存储元素的 Status() 等任何 WinRT 方法 ——
+	// 旧 GC 扫描（erase_if + op.Status()）正是两次 APPCRASH（读悬空
+	// IAsyncAction 的 IAsyncInfo 虚表，偏移 0x994e/0x995d）的崩溃现场。
 	mutable std::mutex m_pendingMtx;
 	std::vector<winrt::Windows::Foundation::IAsyncAction> m_pendingOps;
 

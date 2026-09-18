@@ -13,9 +13,6 @@ Audio_Bridge_Icon.png
 # Internal development / planning notes
 OPTIMIZATION_PLAN.md
 
-# Inno Setup packaging script (contains local, machine-specific paths)
-setup.iss
-
 # Detached git metadata left over from the original upstream repository
 .git_disabled/
 .gitignore_disabled

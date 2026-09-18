@@ -36,6 +36,12 @@ constexpr UINT_PTR IDT_HEALTHCHECK = 2;
 constexpr UINT HEALTHCHECK_INTERVAL_MS = 30000;  // 30 秒一次
 // 蓝牙适配器设备通知句柄（RegisterDeviceNotification 返回）
 HDEVNOTIFY g_hDeviceNotify = nullptr;
+// 【托盘修复】picker flyout 当前是否处于显示状态（Show 成功后置 true，
+// DevicePickerDismissed 回调置 false）。用途：
+//   a) 未显示过时跳过 Hide() —— 对 fresh picker 调 Hide 行为未文档化，
+//      若抛异常会让后续 Show 永远不执行（"点了没反应"的一层保险）；
+//   b) 连点防护的依据。
+static bool s_pickerShown = false;
 // 蓝牙 HCI 接口 GUID（文件作用域：注册通知与 WM_DEVICECHANGE 过滤共用）
 // GUID_DEVINTERFACE_BLUETOOTH = {0850302A-B344-4fda-9BE9-90576B8D46F0}
 constexpr GUID kGuidDevinterfaceBluetooth =
@@ -49,7 +55,7 @@ AudioDeviceMonitor g_audioDeviceMonitor;
 // ==========================================================================
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupMenu();
-void ShowDevicePickerAtCursor();
+void ShowDevicePickerAtTray();
 void SetupDevicePicker();
 void SetupTrayIcons();
 void UpdateNotifyIcon();
@@ -92,8 +98,10 @@ UINT& AudioPlaybackApp::TaskbarCreatedMsg() noexcept { return WM_TASKBAR_CREATED
 
 int AudioPlaybackApp::RunMessageLoop()
 {
-	MSG msg;
-	while (GetMessageW(&msg, nullptr, 0, 0))
+	// 【僵尸修复】GetMessageW 出错时返回 -1，旧代码把它当"真值"继续循环。
+	// 只把 > 0（取到消息）当作继续条件；0（WM_QUIT）与 -1（错误）都退出。
+	MSG msg{};
+	while (GetMessageW(&msg, nullptr, 0, 0) > 0)
 	{
 		TranslateMessage(&msg);
 		DispatchMessageW(&msg);
@@ -101,20 +109,19 @@ int AudioPlaybackApp::RunMessageLoop()
 	return static_cast<int>(msg.wParam);
 }
 
-void AudioPlaybackApp::RegisterPendingOp(winrt::Windows::Foundation::IAsyncAction op)
-{
-	if (!op) return;
-	std::lock_guard lock(m_pendingMtx);
-	GarbageCollectCompletedOps_NoLock();
-	m_pendingOps.push_back(std::move(op));
-}
-
-void AudioPlaybackApp::GarbageCollectCompletedOps_NoLock()
-{
-	std::erase_if(m_pendingOps, [](const auto& op) {
-		return !op || op.Status() != winrt::Windows::Foundation::AsyncStatus::Started;
-	});
-}
+// ==========================================================================
+// 【崩溃修复】pending ops 登记策略重构
+//
+// 旧设计（已删除）：RegisterPendingOp 把 IAsyncAction 存进向量，每次登记前
+//   用 erase_if + op.Status() 全表扫描回收已完成项（GarbageCollectCompletedOps）。
+//   对悬空元素调用 Status()（QI IAsyncInfo + get_Status 虚调用）就是两次
+//   APPCRASH（偏移 0x994e / 0x995d，两个不同构建、同一路径）的崩溃现场。
+//
+// 新设计：Launch 协程启动时登记自身、任何出口自摘除 —— 自摘除只做指针
+//   相等比较（零虚调用），永不对存储的元素调用任何 WinRT 方法。
+//   ShutdownAsync 退出时快照清空并限时等待（快照持有自己的强引用，
+//   不受 Launch 自摘除影响）。见 LaunchConnectAsyncByDeviceInfo 实现。
+// ==========================================================================
 
 // T6: 优雅退出异步流程
 winrt::Windows::Foundation::IAsyncAction AudioPlaybackApp::ShutdownAsync()
@@ -142,11 +149,9 @@ winrt::Windows::Foundation::IAsyncAction AudioPlaybackApp::ShutdownAsync()
 	for (auto& op : snapshot)
 	{
 		if (!op) continue;
-		const auto status = op.Status();
-		if (status == winrt::Windows::Foundation::AsyncStatus::Completed ||
-			status == winrt::Windows::Foundation::AsyncStatus::Error ||
-			status == winrt::Windows::Foundation::AsyncStatus::Canceled)
-			continue;
+		// 【崩溃修复】不再调用 op.Status() 预检终态（两次 APPCRASH 均发生在
+		// 该调用对悬空 IAsyncAction 的解引用上）。已完成的 op 在 co_await 内部
+		// await_ready 快速路径立即返回，无需提前查询。
 
 		const auto now = std::chrono::steady_clock::now();
 		if (now >= deadline) break;
@@ -164,7 +169,9 @@ winrt::Windows::Foundation::IAsyncAction AudioPlaybackApp::ShutdownAsync()
 			co_await winrt::resume_after(remaining);
 			try
 			{
-				if (op_copy && op_copy.Status() == winrt::Windows::Foundation::AsyncStatus::Started)
+				// 【崩溃修复】不再查 Status()：对已完成的 op 调 Cancel 是文档化
+				// no-op；对 Started 的 op 则强制取消（超时兜底）
+				if (op_copy)
 					op_copy.Cancel();
 			}
 			catch (...) {}
@@ -184,28 +191,54 @@ winrt::Windows::Foundation::IAsyncAction AudioPlaybackApp::ShutdownAsync()
 }
 
 // 便捷 Launch 封装：启动连接并登记（保留 fire_and_forget 语义，便于 WndProc/回调 中使用）
+// 【崩溃修复】登记策略重构：协程启动时把 op 登记进 m_pendingOps（向量持有
+// 自己的强引用），任何出口（成功/失败/取消/异常）都自摘除 —— 自摘除只做
+// 指针相等比较，零虚调用。取代旧的"RegisterPendingOp + Status() 全表扫描
+// 回收"（扫描对悬空元素的 Status() 调用正是两次 APPCRASH 的崩溃现场）。
 winrt::fire_and_forget AudioPlaybackApp::LaunchConnectAsyncByDeviceInfo(DevicePicker picker, DeviceInformation device)
 {
+	winrt::Windows::Foundation::IAsyncAction op{ nullptr };
 	try
 	{
-		auto op = m_connections.ConnectAsync(std::move(picker), std::move(device));
-		RegisterPendingOp(op);
+		op = m_connections.ConnectAsync(std::move(picker), std::move(device));
+		{
+			std::lock_guard lock(m_pendingMtx);
+			m_pendingOps.push_back(op);  // 拷贝登记：向量持有自己的强引用
+		}
 		co_await op;
 	}
 	catch (const winrt::hresult_canceled&) {}
 	catch (...) { LOG_CAUGHT_EXCEPTION(); }
+
+	// 自摘除（纯指针比较，不触碰对象）；ShutdownAsync 的快照持有自己的
+	// 强引用，不受此处 erase 影响。
+	if (op)
+	{
+		std::lock_guard lock(m_pendingMtx);
+		std::erase_if(m_pendingOps, [&op](const auto& e) { return e == op; });
+	}
 }
 
 winrt::fire_and_forget AudioPlaybackApp::LaunchConnectAsyncById(DevicePicker picker, std::wstring_view deviceId)
 {
+	winrt::Windows::Foundation::IAsyncAction op{ nullptr };
 	try
 	{
-		auto op = m_connections.ConnectAsync(std::move(picker), deviceId);
-		RegisterPendingOp(op);
+		op = m_connections.ConnectAsync(std::move(picker), deviceId);
+		{
+			std::lock_guard lock(m_pendingMtx);
+			m_pendingOps.push_back(op);
+		}
 		co_await op;
 	}
 	catch (const winrt::hresult_canceled&) {}
 	catch (...) { LOG_CAUGHT_EXCEPTION(); }
+
+	if (op)
+	{
+		std::lock_guard lock(m_pendingMtx);
+		std::erase_if(m_pendingOps, [&op](const auto& e) { return e == op; });
+	}
 }
 
 // 为 SettingsUtil.hpp 提供：从 App 层查询当前活动连接 ID 列表（保持稳定顺序）
@@ -382,6 +415,23 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
 	ShowWindow(hWnd, SW_HIDE);
 
+	// ===== 【托盘修复：picker 弹不出来的根因】=====
+	// DevicePicker 的 flyout 是 XAML UI，宿主线程必须先初始化 XAML Islands
+	// 运行时（含 DispatcherQueue），否则 picker.Show() 抛异常（被
+	// ShowDevicePickerAtTray 的 catch 静默吞掉 → "点了托盘没反应"）。
+	// 上游 ysc3839/AudioPlaybackConnector 在此处创建 DesktopWindowXamlSource
+	// 并 AttachToWindow —— 其副作用正是为宿主线程初始化 XAML 运行时；
+	// 本程序不使用 XAML 菜单，无需 DesktopWindowXamlSource，
+	// 用更轻量的 WindowsXamlManager::InitializeForCurrentThread() 达成同样效果。
+	// 返回的管理器对象必须存活到进程结束（static 局部存储）。
+	static winrt::Windows::UI::Xaml::Hosting::WindowsXamlManager s_xamlManager{ nullptr };
+	try
+	{
+		s_xamlManager =
+			winrt::Windows::UI::Xaml::Hosting::WindowsXamlManager::InitializeForCurrentThread();
+	}
+	CATCH_LOG();
+
 	LoadTranslateData();
 	LoadSettings();
 	SetAutoStart(g_autoStart);
@@ -442,7 +492,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	bool isStartupLaunch = (wcsstr(lpCmdLine, L"/startup") != nullptr);
 	if (!isStartupLaunch)
 	{
-		ShowDevicePickerAtCursor();
+		ShowDevicePickerAtTray();
 	}
 
 	return app.RunMessageLoop();
@@ -564,6 +614,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		// 3) 触发标准窗口销毁 → 走 WM_DESTROY → WM_DESTROY 中 PostQuitMessage
 		//    （严格遵循 Win32 消息循环退出范式）
 		DestroyWindow(hWnd);
+		// 4) 【僵尸修复】DestroyWindow 内部（销毁 owned 的 picker flyout 窗口 /
+		//    跨线程 SendMessage 派发）会运行嵌套消息泵，可能把 WM_DESTROY 里
+		//    PostQuitMessage 投出的 WM_QUIT 消费掉 → 外层 GetMessageW 永远
+		//    阻塞在 win32u 消息等待 → 进程变僵尸（窗口已亡但进程不死、Mutex
+		//    残留，后续启动全部"点了没反应"）。DestroyWindow 返回后补发一次
+		//    WM_QUIT，确保外层消息循环必定退出。多余的 WM_QUIT 无害（进程
+		//    随即退出，不会有人再取）。
+		PostQuitMessage(0);
 	}
 	break;
 
@@ -600,7 +658,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		{
 		case NIN_SELECT:
 		case NIN_KEYSELECT:
-			ShowDevicePickerAtCursor();
+			ShowDevicePickerAtTray();
 			break;
 		case WM_CONTEXTMENU:
 		{
@@ -762,7 +820,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_SHOWPICKER:
 		// 由单实例第二次启动（桌面快捷方式/开始菜单图标）触发，
 		// 行为与点击托盘图标左键完全一致：弹出设备选择对话框。
-		ShowDevicePickerAtCursor();
+		ShowDevicePickerAtTray();
 		break;
 
 	case WM_APP_QUITREQUEST:
@@ -788,20 +846,83 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 // ==========================================================================
 // 辅助：DevicePicker 定位、菜单、托盘图标
 // ==========================================================================
-void ShowDevicePickerAtCursor()
+// 【Bug 修复：点托盘图标弹不出设备列表，连点几次后进程直接消失】
+// 旧实现只调 picker.Show(光标位置-200, 400x400)，缺了四个关键步骤（对照上游
+// ysc3839/AudioPlaybackConnector 验证过的成熟序列）：
+//   1) Show 的 Rect 参数是 DIP（96 DPI 基准），本程序是 PerMonitorV2 DPI 感知
+//      （见 AudioBridge.manifest），直接传物理像素在 125%/150% 缩放屏上
+//      坐标偏差 1.25/1.5 倍，flyout 弹到屏幕外 → "点了没弹出界面"。
+//   2) 任务栏本身是 topmost 窗口，宿主窗口不置顶时 flyout 会被任务栏盖住。
+//   3) 宿主窗口未取得前台激活权，flyout 拿不到焦点，随即被系统自动关闭。
+//   4) picker 处于"显示中"时再次调用 Show() 会抛 hresult_error，异常逃出
+//      WndProc → std::terminate → 进程无声退出（"多点几次程序就没了"）。
+// 修复：Shell_NotifyIconGetRect 取图标真实矩形 → 换算 DIP → 隐藏宿主窗口
+// 置顶铺屏 → SetForegroundWindow → Hide 后 Show(rect, Placement::Above)；
+// 整段 try/catch 兜底，任何 picker 故障只记日志，绝不终止进程。
+void ShowDevicePickerAtTray()
 {
+	auto& app = AudioPlaybackApp::Instance();
 	// Bug 修复：正在退出（ShutdownAsync 协程运行中）时窗口即将销毁，
 	// 不再弹出 picker；单实例二次启动（WM_SHOWPICKER）可能恰好撞上退出流程。
-	if (AudioPlaybackApp::Instance().IsExiting()) return;
+	if (app.IsExiting()) return;
 
-	POINT pt;
-	GetCursorPos(&pt);
-	// Bug 修复：光标在屏幕左上角时 pt-200 产生负坐标 → 钳制到 0
-	// （(std::max) 加括号规避 windows.h 的 max 宏，与 ReconnectScheduler 一致）
-	const float x = (std::max)(0.0f, static_cast<float>(pt.x) - 200.0f);
-	const float y = (std::max)(0.0f, static_cast<float>(pt.y) - 200.0f);
-	winrt::Windows::Foundation::Rect rect{ x, y, 400, 400 };
-	AudioPlaybackApp::Instance().GetDevicePicker().Show(rect);
+	// ===== 【连点防护】=====
+	//   1) 重入闸（同调用栈）：picker.Show() 的 flyout 内部若运行嵌套消息泵，
+	//      二次托盘点击会被嵌套泵派发成重入调用 —— Hide/Show 重入可把 flyout
+	//      内部状态机打入永久失效（此后 Show 每次失败 → "点了没反应"）。
+	//   2) 节流闸（400ms）：Show 返回后 flyout 仍处于显示中，快速连续点击会
+	//      反复 Hide/Show —— Hide 是异步生效的，紧随其后的 Show 撞上
+	//      "仍显示中"会抛异常。
+	static bool s_inCall = false;
+	static std::chrono::steady_clock::time_point s_lastShow{};
+	if (s_inCall) return;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - s_lastShow < std::chrono::milliseconds(400)) return;
+	struct CallGuard { ~CallGuard() { s_inCall = false; } } callGuard;
+	s_inCall = true;
+	s_lastShow = now;
+
+	try
+	{
+		// 1) 托盘图标的真实屏幕矩形（坐标恒定有效，不依赖光标位置）
+		NOTIFYICONIDENTIFIER nii = { sizeof(nii) };
+		nii.hWnd = app.GetMainWnd();
+		nii.uID = app.GetNid().uID;
+		RECT iconRect{};
+		winrt::check_hresult(Shell_NotifyIconGetRect(&nii, &iconRect));
+
+		// 2) 物理像素 → DIP（DevicePicker 的 Rect 以 96 DPI 为基准）
+		HWND const hWnd = app.GetMainWnd();
+		const UINT dpi = GetDpiForWindow(hWnd);
+		const float scale = static_cast<float>(USER_DEFAULT_SCREEN_DPI) / static_cast<float>(dpi);
+		const winrt::Windows::Foundation::Rect rect{
+			static_cast<float>(iconRect.left) * scale,
+			static_cast<float>(iconRect.top) * scale,
+			static_cast<float>(iconRect.right - iconRect.left) * scale,
+			static_cast<float>(iconRect.bottom - iconRect.top) * scale };
+
+		// 3) 隐藏宿主窗口置顶并铺满屏幕：flyout 从属于宿主，宿主不置顶就画不过
+		//    topmost 的任务栏。SWP_HIDEWINDOW 保证窗口保持隐藏，不会闪现。
+		SetWindowPos(hWnd, HWND_TOPMOST, 0, 0,
+			GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), SWP_HIDEWINDOW);
+		// 4) 抢占前台激活权，flyout 才不会被系统瞬间自动关闭
+		SetForegroundWindow(hWnd);
+
+		auto& picker = app.GetDevicePicker();
+		// 5) 只在确曾显示过时 Hide：picker 仍"显示中"时直接 Show 会抛异常
+		//    （连点崩溃的元凶）；而对从未显示过的 fresh picker 调 Hide 行为
+		//    未文档化，若抛异常会让后面的 Show 永远不执行。s_pickerShown 由
+		//    Show 成功置 true、DevicePickerDismissed 回调置 false，见全局定义。
+		if (s_pickerShown)
+			picker.Hide();
+		picker.Show(rect, winrt::Windows::UI::Popups::Placement::Above);
+		s_pickerShown = true;
+	}
+	catch (...)
+	{
+		// 兜底：托盘常驻工具绝不能因 UI 故障而退出
+		LOG_CAUGHT_EXCEPTION();
+	}
 }
 
 void SetupMenu()
@@ -825,7 +946,9 @@ void SetupDevicePicker()
 
 	picker.Filter().SupportedDeviceSelectors().Append(AudioPlaybackConnection::GetDeviceSelector());
 
-	picker.DevicePickerDismissed([](const auto&, const auto&) {});
+	// flyout 关闭（用户点击别处 / 选择设备 / 断开）时清除显示状态标志，
+	// 供 ShowDevicePickerAtTray 的条件 Hide 与连点防护使用
+	picker.DevicePickerDismissed([](const auto&, const auto&) { s_pickerShown = false; });
 
 	picker.DeviceSelected([](const auto& sender, const auto& args)
 	{

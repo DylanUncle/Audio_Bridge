@@ -55,7 +55,7 @@ extern std::vector<std::wstring> g_lastDevices;
 
 void QueueAutoReconnect(std::wstring deviceId);
 void ShowToastNotification(const std::wstring& title, const std::wstring& message);
-void ShowDevicePickerAtCursor();
+void ShowDevicePickerAtTray();
 
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device);
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view deviceId);

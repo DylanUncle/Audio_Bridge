@@ -61,8 +61,16 @@ enum class AudioProtocol
 // 到时强制 Cancel → co_await 抛出 hresult_canceled → 走既有的取消清理路径
 // （CleanupEntry + 调度器保留条目继续退避重试）。
 // 注：协议层超时（RequestTimedOut）约 20~30s，应用层兜底须长于它 → 45s。
+//
+// 【崩溃修复】旧 WithTimeout 在超时 lambda 里调用 opCopy.Status() 查询状态，
+// 与 App 层 GC 扫描谓词被链接器折叠为同一份代码 —— 正是两次 APPCRASH
+// （偏移 0x994e / 0x995d，读悬空 IAsyncAction 的 IAsyncInfo 虚表）的现场。
+// 现改为 ArmTimeout：只武装"到时强制 Cancel"，不再查询 Status() ——
+// 对已完成的异步操作调用 Cancel 是文档化 no-op，无需预检查。
+// 调用方改用具名局部变量持有异步对象后再 co_await（见 ConnectAsync 内
+// 两处调用点），规避 co_await 操作数临时对象跨挂起点的生命周期陷阱。
 template <typename TAsync>
-[[nodiscard]] TAsync WithTimeout(TAsync const& op, std::chrono::milliseconds timeout)
+void ArmTimeout(TAsync const& op, std::chrono::milliseconds timeout)
 {
 	// fire_and_forget 后台协程：到时强制 Cancel；op 提前完成则 Cancel 无效
 	[opCopy = op, timeout]() -> winrt::fire_and_forget
@@ -70,12 +78,11 @@ template <typename TAsync>
 		co_await winrt::resume_after(timeout);
 		try
 		{
-			if (opCopy && opCopy.Status() == winrt::Windows::Foundation::AsyncStatus::Started)
+			if (opCopy)
 				opCopy.Cancel();
 		}
 		catch (...) {}
 	}();
-	return op;
 }
 
 class ConnectionManager
@@ -485,7 +492,11 @@ public:
 				co_return;
 			}
 
-			co_await WithTimeout(connection.StartAsync(), std::chrono::seconds(45));
+			// 【崩溃修复】异步对象用具名局部变量持有（避免 co_await 操作数
+			// 临时对象的生命周期陷阱），超时兜底只武装 Cancel 不查 Status
+			auto startOp = connection.StartAsync();
+			ArmTimeout(startOp, std::chrono::seconds(45));
+			co_await startOp;
 
 			// 检查点 1：StartAsync 后检查取消
 			if (m_isCancelling.load())
@@ -495,7 +506,9 @@ public:
 				co_return;
 			}
 
-			const auto result = co_await WithTimeout(connection.OpenAsync(), std::chrono::seconds(45));
+			auto openOp = connection.OpenAsync();
+			ArmTimeout(openOp, std::chrono::seconds(45));
+			const auto result = co_await openOp;
 
 			// 检查点 2：OpenAsync 后检查取消
 			if (m_isCancelling.load())
@@ -615,9 +628,13 @@ public:
 		// 其他错误（RPC 瞬断 / 蓝牙栈重启中）不清理 —— 保留退避重试。
 		try
 		{
-			auto device = co_await winrt::Windows::Devices::Enumeration::DeviceInformation::CreateFromIdAsync(deviceId);
+			// 【崩溃修复】异步对象一律用具名局部变量持有后再 co_await，
+			// 规避 co_await 操作数临时对象跨挂起点的生命周期陷阱
+			auto createOp = winrt::Windows::Devices::Enumeration::DeviceInformation::CreateFromIdAsync(deviceId);
+			auto device = co_await createOp;
 			if (m_isCancelling.load()) co_return;
-			co_await ConnectAsync(std::move(picker), std::move(device));
+			auto connectOp = ConnectAsync(std::move(picker), std::move(device));
+			co_await connectOp;
 		}
 		catch (const winrt::hresult_canceled&)
 		{

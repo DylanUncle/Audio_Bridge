@@ -72,7 +72,13 @@
 #include <winrt/Windows.Media.Audio.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Xaml.h>
+// 【托盘修复】DevicePicker 的 flyout 是 XAML UI：宿主线程须先经
+// WindowsXamlManager::InitializeForCurrentThread() 初始化 XAML Islands
+// 运行时（含 DispatcherQueue），否则 picker.Show() 抛异常（"点了没反应"）
+#include <winrt/Windows.UI.Xaml.Hosting.h>
 #include <winrt/Windows.UI.Notifications.h>
+// DevicePicker.Show(rect, Placement) 需要 Placement 枚举（托盘弹出设备列表）
+#include <winrt/Windows.UI.Popups.h>
 #include <winrt/Windows.Data.Xml.Dom.h>
 
 #endif //PCH_H
