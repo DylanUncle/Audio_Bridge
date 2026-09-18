@@ -1,0 +1,71 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2026 Dylan
+# This file is distributed under the same license as the Audio Bridge package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: Audio Bridge\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2020-07-06 19:07+0800\n"
+"PO-Revision-Date: 2020-07-06 19:07+0800\n"
+"Last-Translator: Dylan\n"
+"Language-Team: \n"
+"Language: zh_TW\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"X-Generator: Poedit 2.3.1\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+#: AudioBridge.cpp:39
+msgid "Unsupported Operating System"
+msgstr "作業系統不支援"
+
+#: AudioBridge.cpp:39
+msgid "Audio Bridge is not supported on this operating system version."
+msgstr "Audio Bridge 不支援此作業系統版本。"
+
+#: AudioBridge.cpp:75
+msgid "Audio Bridge"
+msgstr ""
+
+#: AudioBridge.cpp:196
+msgid ""
+"All connections will be closed.\n"
+"Exit anyway?"
+msgstr ""
+"將會關閉所有連線。\n"
+"執意結束?"
+
+#: AudioBridge.cpp:201
+msgid "Reconnect on next start"
+msgstr "下次啟動時重新連線"
+
+#: AudioBridge.cpp:204 AudioBridge.cpp:240
+msgid "Exit"
+msgstr "結束"
+
+#: AudioBridge.cpp:230
+msgid "Bluetooth Settings"
+msgstr "藍牙設定"
+
+#: AudioBridge.cpp:287
+msgid "Connecting"
+msgstr "連線中"
+
+#: AudioBridge.cpp:322
+msgid "The request timed out"
+msgstr "要求逾時"
+
+#: AudioBridge.cpp:326
+msgid "The operation was denied by the system"
+msgstr "系統拒絕動作"
+
+#: AudioBridge.cpp:337
+msgid "Unknown error"
+msgstr "未知錯誤"
+
+#: AudioBridge.cpp:362
+msgid "Connected"
+msgstr "已連線"

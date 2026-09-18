@@ -1,0 +1,125 @@
+## Audio Bridge — .gitignore
+## Visual Studio / MSBuild project
+## Rules below are adapted from
+## https://github.com/github/gitignore/blob/main/VisualStudio.gitignore
+
+# ===============================================================
+# 1. Local-only files (kept out of the public repository)
+# ===============================================================
+
+# Source artwork for the app icon (the generated AudioBridge.ico IS committed)
+Audio_Bridge_Icon.png
+
+# Internal development / planning notes
+OPTIMIZATION_PLAN.md
+
+# Inno Setup packaging script (contains local, machine-specific paths)
+setup.iss
+
+# Detached git metadata left over from the original upstream repository
+.git_disabled/
+.gitignore_disabled
+
+# NOTE: translate/generated/ is intentionally NOT ignored. Its translate.rc is a
+# required <ResourceCompile> input of AudioBridge.vcxproj and nothing in the
+# build regenerates it, so it is committed to keep a fresh clone buildable.
+
+# ===============================================================
+# 2. Build output and MSBuild intermediates
+# ===============================================================
+
+# IntelliSense / MSBuild intermediate directories
+[Oo]bj/
+AudioBridge/
+AudioPla.*/
+Generated Files/
+
+# Per-configuration output directories
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+
+# Installer output (Inno Setup -> setup.iss [OutputDir])
+Output/
+[Ee]xpress/
+
+# ===============================================================
+# 3. Compiled binaries and linker / compiler by-products
+# ===============================================================
+
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.obj
+*.iobj
+*.ipdb
+*.pch
+*.res
+*.tlog
+*.rsp
+*.lastbuildstate
+*.cache
+*.recipe
+*.log
+*.appx
+
+# ===============================================================
+# 4. Visual Studio / IDE user-specific settings
+# ===============================================================
+
+.vs/
+.vscode/
+*.suo
+*.user
+*.rsuser
+*.userosscache
+*.userprefs
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+*.opendb
+*.opensdf
+*.sdf
+*.aps
+*.ncb
+ipch/
+*.psess
+*.vsp
+*.vspx
+*.sap
+*.binlog
+
+# ===============================================================
+# 5. NuGet
+# ===============================================================
+
+*.nupkg
+*.nuget.props
+*.nuget.targets
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+
+# ===============================================================
+# 6. Miscellaneous
+# ===============================================================
+
+~$*
+*~
+*.dbmdl
+*.jfm
+*.pfx
+*.publishsettings
+*.cachefile
+*.svclog
+*.scc
